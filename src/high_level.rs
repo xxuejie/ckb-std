@@ -2,7 +2,7 @@ use crate::ckb_constants::*;
 use crate::debug;
 use crate::error::SysError;
 use crate::syscalls;
-use alloc::{vec, vec::Vec};
+use alloc::{ffi::CString, vec, vec::Vec};
 use ckb_types::{core::ScriptHashType, packed::*, prelude::*};
 use core::convert::Infallible;
 use core::ffi::CStr;
@@ -622,6 +622,74 @@ pub fn exec_cell(
     syscalls::exec_cell(code_hash, hash_type, offset, length, argv)
 }
 
+pub trait ArgvEncoding {
+    type Item;
+
+    fn encode(a: &Self::Item) -> Result<CString, SysError>;
+}
+
+pub trait ArgvDecoding {
+    type Item;
+
+    fn decode(a: &CStr) -> Result<Self::Item, SysError>;
+}
+
+pub struct SliceEncoder<'a> {
+    marker: core::marker::PhantomData<&'a ()>,
+}
+
+impl<'a> ArgvEncoding for SliceEncoder<'a> {
+    type Item = &'a [u8];
+
+    fn encode(a: &Self::Item) -> Result<CString, SysError> {
+        let mut bytes: Vec<u8> = a
+            .iter()
+            .flat_map(|b| match b {
+                0x0 => vec![0xFF, 0xF1],
+                0xFF => vec![0xFF, 0xF0],
+                _ => vec![*b],
+            })
+            .collect();
+        bytes.push(0);
+        Ok(CString::from_vec_with_nul(bytes).unwrap())
+    }
+}
+
+pub struct VecEncoder {}
+pub struct VecDecoder {}
+
+impl ArgvEncoding for VecEncoder {
+    type Item = Vec<u8>;
+
+    fn encode(a: &Self::Item) -> Result<CString, SysError> {
+        SliceEncoder::encode(&a.as_slice())
+    }
+}
+
+impl ArgvDecoding for VecDecoder {
+    type Item = Vec<u8>;
+
+    fn decode(a: &CStr) -> Result<Self::Item, SysError> {
+        let mut ret = vec![];
+        let mut i = 0;
+
+        let data = a.to_bytes();
+        while i < data.len() {
+            if data[i] == 0xFF {
+                if i + 1 >= data.len() {
+                    return Err(SysError::Encoding);
+                }
+                ret.push(data[i + 1].wrapping_add(0xF));
+                i += 2;
+            } else {
+                ret.push(data[i]);
+                i += 1;
+            }
+        }
+        Ok(ret)
+    }
+}
+
 /// Locate a cell in cell deps and load the cell data for execution.
 ///
 /// # Arguments
@@ -631,21 +699,18 @@ pub fn exec_cell(
 /// * `offset`    - the offset of the cell data to load.
 /// * `length`    - the length of the cell data to load, if the length is 0, load the whole cell data starting from offset.
 /// * `args`      - the arguments to pass to the execution.
-pub fn exec_cell_with_args(
+pub fn exec_cell_with_args<T, E: ArgvEncoding<Item = T>, I: IntoIterator<Item = T>>(
     code_hash: &[u8],
     hash_type: ScriptHashType,
     offset: u32,
     length: u32,
-    args: &[u8],
+    args: I,
 ) -> Result<Infallible, SysError> {
-    let args_with_nul: Vec<Vec<u8>> = args
-        .split(|i| *i == 0)
-        .map(|slice| [slice, &[0]].concat().to_vec())
-        .collect();
-    let argv: Vec<&CStr> = args_with_nul
-        .iter()
-        .map(|bytes| CStr::from_bytes_with_nul(bytes).unwrap())
-        .collect();
+    let args_with_nul: Vec<CString> = args
+        .into_iter()
+        .map(|arg| E::encode(&arg))
+        .collect::<Result<Vec<CString>, SysError>>()?;
+    let argv: Vec<&CStr> = args_with_nul.iter().map(|bytes| bytes.as_c_str()).collect();
 
     #[cfg(not(feature = "simulator"))]
     {
